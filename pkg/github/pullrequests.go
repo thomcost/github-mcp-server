@@ -11,6 +11,7 @@ import (
 	"github.com/google/go-github/v69/github"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/shurcooL/githubv4"
 )
 
 // GetPullRequest creates a tool to get details of a specific pull request.
@@ -1239,6 +1240,354 @@ func CreatePullRequest(getClient GetClientFn, t translations.TranslationHelperFu
 			}
 
 			r, err := json.Marshal(pr)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
+
+// MVPCreatePendingPullRequestReview creates a tool to create a pending review on a pull request.
+func MVPCreatePendingPullRequestReview(getGQLClient GetGQLClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("mvp_create_pending_pull_request_review",
+			mcp.WithDescription(t("TOOL_MVP_CREATE_PENDING_PULL_REQUEST_REVIEW_DESCRIPTION", "Create a pending review for a pull request.")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_MVP_CREATE_PENDING_PULL_REQUEST_REVIEW_USER_TITLE", "Create pending pull request review"),
+				ReadOnlyHint: false,
+			}),
+			// Either we need the PR GQL Id directly, or we need owner, repo and PR number to look it up.
+			// Since our other Pull Request tools are working with the REST Client, will handle the lookup
+			// internally for now.
+			mcp.WithString("owner",
+				mcp.Required(),
+				mcp.Description("Repository owner"),
+			),
+			mcp.WithString("repo",
+				mcp.Required(),
+				mcp.Description("Repository name"),
+			),
+			mcp.WithNumber("pullNumber",
+				mcp.Required(),
+				mcp.Description("Pull request number"),
+			),
+			mcp.WithString("commitId",
+				mcp.Description("SHA of commit to review"),
+			),
+			// Event is omitted here because we always want to create a pending review.
+			// Threads are omitted for the moment, and we'll see if the LLM can use the appropriate tool.
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			owner, err := requiredParam[string](request, "owner")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			repo, err := requiredParam[string](request, "repo")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			pullNumber, err := RequiredInt(request, "pullNumber")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Given our owner, repo and PR number, lookup the GQL ID of the PR.
+			client, err := getGQLClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub GQL client: %w", err)
+			}
+
+			var getPullRequestQuery struct {
+				Repository struct {
+					PullRequest struct {
+						ID githubv4.ID
+					} `graphql:"pullRequest(number: $prNum)"`
+				} `graphql:"repository(owner: $owner, name: $repo)"`
+			}
+			if err := client.Query(ctx, &getPullRequestQuery, map[string]any{
+				"owner": githubv4.String(owner),
+				"repo":  githubv4.String(repo),
+				"prNum": githubv4.Int(pullNumber),
+			}); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Now we have the GQL ID, we can create a pending review
+			var addPullRequestReviewMutation struct {
+				AddPullRequestReview struct {
+					PullRequestReview struct {
+						ID githubv4.ID
+					}
+				} `graphql:"addPullRequestReview(input: $input)"`
+			}
+
+			if err := client.Mutate(
+				ctx,
+				&addPullRequestReviewMutation,
+				githubv4.AddPullRequestReviewInput{
+					PullRequestID: getPullRequestQuery.Repository.PullRequest.ID,
+					// CommitOID:        &"",
+					// Body:             &"",
+					// Event:            &"",
+					// Comments:         &[]*githubv4.DraftPullRequestReviewComment{},
+					// Threads:          &[]*githubv4.DraftPullRequestReviewThread{},
+				},
+				nil,
+			); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Return the GQL IDs of the PR and review in a JSON structure that is understandable by the LLM,
+			// so that it can be used by the add review comment and submission tools.
+			response := map[string]any{
+				"pullRequestID":       getPullRequestQuery.Repository.PullRequest.ID,
+				"pullRequestReviewID": addPullRequestReviewMutation.AddPullRequestReview.PullRequestReview.ID,
+			}
+
+			r, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
+
+// MVPAddPullRequestReviewComment creates a tool to add a comment to a pull request review.
+func MVPAddPullRequestReviewComment(getGQLClient GetGQLClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("mvp_add_pull_request_review_comment",
+			mcp.WithDescription(t("TOOL_MVP_ADD_PULL_REQUEST_REVIEW_COMMENT_DESCRIPTION", "Add a comment to a pull request review.")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_MVP_ADD_PULL_REQUEST_REVIEW_COMMENT_USER_TITLE", "Add comment to pull request review"),
+				ReadOnlyHint: false,
+			}),
+			// We don't need these any more if we have the review ID.
+			// mcp.WithString("owner",
+			// 	mcp.Required(),
+			// 	mcp.Description("Repository owner"),
+			// ),
+			// mcp.WithString("repo",
+			// 	mcp.Required(),
+			// 	mcp.Description("Repository name"),
+			// ),
+			// mcp.WithNumber("pull_number",
+			// 	mcp.Required(),
+			// 	mcp.Description("Pull request number"),
+			// ),
+			// I think maybe only one of these is required?
+			// mcp.WithString("pullRequestID",
+			// 	mcp.Required(),
+			// 	mcp.Description("The ID of the pull request to add a comment to"),
+			// ),
+			mcp.WithString("pullRequestReviewID",
+				mcp.Required(),
+				mcp.Description("The ID of the pull request review to add a comment to"),
+			),
+			mcp.WithString("path",
+				mcp.Required(),
+				mcp.Description("The relative path to the file that necessitates a comment. Required unless in_reply_to is specified."),
+			),
+			mcp.WithString("body",
+				mcp.Required(),
+				mcp.Description("The text of the review comment"),
+			),
+			mcp.WithNumber("line",
+				mcp.Description("The line of the blob in the pull request diff that the comment applies to. For multi-line comments, the last line of the range"),
+			),
+
+			// TODO: Advanced parameters
+			// mcp.WithString("subject_type",
+			// 	mcp.Description("The level at which the comment is targeted"),
+			// 	mcp.Enum("line", "file"),
+			// ),
+			// mcp.WithNumber("line",
+			// 	mcp.Description("The line of the blob in the pull request diff that the comment applies to. For multi-line comments, the last line of the range"),
+			// ),
+			// mcp.WithString("side",
+			// 	mcp.Description("The side of the diff to comment on"),
+			// 	mcp.Enum("LEFT", "RIGHT"),
+			// ),
+			// mcp.WithNumber("start_line",
+			// 	mcp.Description("For multi-line comments, the first line of the range that the comment applies to"),
+			// ),
+			// mcp.WithString("start_side",
+			// 	mcp.Description("For multi-line comments, the starting side of the diff that the comment applies to"),
+			// 	mcp.Enum("LEFT", "RIGHT"),
+			// ),
+			// Line *Int `json:"line,omitempty"`
+			// // The side of the diff on which the line resides. For multi-line comments, this is the side for the end of the line range. (Optional.)
+			// Side *DiffSide `json:"side,omitempty"`
+			// // The first line of the range to which the comment refers. (Optional.)
+			// StartLine *Int `json:"startLine,omitempty"`
+			// // The side of the diff on which the start line resides. (Optional.)
+			// StartSide *DiffSide `json:"startSide,omitempty"`
+			// // The level at which the comments in the corresponding thread are targeted, can be a diff line or a file. (Optional.)
+			// SubjectType *PullRequestReviewThreadSubjectType `json:"subjectType,omitempty"`
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pullRequestReviewID, err := requiredParam[githubv4.ID](request, "pullRequestReviewID")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			path, err := requiredParam[string](request, "path")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			body, err := requiredParam[string](request, "body")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			line, err := RequiredInt(request, "line")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Prepare the mutation
+			var addPullRequestReviewThreadMutation struct {
+				AddPullRequestReviewThread struct {
+					Thread struct {
+						ID githubv4.ID
+					}
+				} `graphql:"addPullRequestReviewThread(input: $input)"`
+			}
+
+			client, err := getGQLClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub GQL client: %w", err)
+			}
+
+			if err := client.Mutate(
+				ctx,
+				&addPullRequestReviewThreadMutation,
+				githubv4.AddPullRequestReviewThreadInput{
+					Path:                githubv4.String(path),
+					Body:                githubv4.String(body),
+					Line:                githubv4.NewInt(githubv4.Int(line)),
+					PullRequestReviewID: &pullRequestReviewID,
+
+					// PullRequestID:       &nil,
+					// Side:                &"",
+					// StartLine:           &0,
+					// StartSide:           &"",
+					// SubjectType:         &"",
+
+					// PullRequestID:       &pullRequestID,
+				},
+				nil,
+			); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Return the GQL ID of the review thread in a JSON structure that is understandable by the LLM.
+			response := map[string]any{
+				"pullRequestReviewThreadID": addPullRequestReviewThreadMutation.AddPullRequestReviewThread.Thread.ID,
+			}
+			r, err := json.Marshal(response)
+			if err != nil {
+				return nil, fmt.Errorf("failed to marshal response: %w", err)
+			}
+
+			return mcp.NewToolResultText(string(r)), nil
+		}
+}
+
+// MVPSubmitPullRequestReview creates a tool to submit a pull request review.
+func MVPSubmitPullRequestReview(getGQLClient GetGQLClientFn, t translations.TranslationHelperFunc) (tool mcp.Tool, handler server.ToolHandlerFunc) {
+	return mcp.NewTool("mvp_submit_pull_request_review",
+			mcp.WithDescription(t("TOOL_MVP_SUBMIT_PULL_REQUEST_REVIEW_DESCRIPTION", "Submit a review for a pull request.")),
+			mcp.WithToolAnnotation(mcp.ToolAnnotation{
+				Title:        t("TOOL_MVP_SUBMIT_PULL_REQUEST_REVIEW_USER_TITLE", "Submit review for pull request"),
+				ReadOnlyHint: false,
+			}),
+			// We don't need these any more if we have the review ID.
+			// mcp.WithString("owner",
+			// 	mcp.Required(),
+			// 	mcp.Description("Repository owner"),
+			// ),
+			// mcp.WithString("repo",
+			// 	mcp.Required(),
+			// 	mcp.Description("Repository name"),
+			// ),
+			// mcp.WithNumber("pull_number",
+			// 	mcp.Required(),
+			// 	mcp.Description("Pull request number"),
+			// ),
+			// I think maybe only one of these is required?
+			// mcp.WithString("pullRequestID",
+			// 	mcp.Required(),
+			// 	mcp.Description("The ID of the pull request to add a comment to"),
+			// ),
+			mcp.WithString("pullRequestReviewID",
+				mcp.Required(),
+				mcp.Description("The ID of the pull request review to add a comment to"),
+			),
+			mcp.WithString("event",
+				mcp.Required(),
+				mcp.Description("The event to perform"),
+				mcp.Enum("APPROVE", "REQUEST_CHANGES", "COMMENT"),
+			),
+			mcp.WithString("body",
+				mcp.Description("The text of the review comment"),
+			),
+		),
+		func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			pullRequestReviewID, err := requiredParam[githubv4.ID](request, "pullRequestReviewID")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			event, err := requiredParam[string](request, "event")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			body, err := OptionalParam[string](request, "body")
+			if err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+			var gqlBody *githubv4.String
+			if body != "" {
+				gqlBody = githubv4.NewString(githubv4.String(body))
+			}
+
+			client, err := getGQLClient(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("failed to get GitHub GQL client: %w", err)
+			}
+
+			// Prepare the mutation
+			var submitPullRequestReviewMutation struct {
+				SubmitPullRequestReview struct {
+					PullRequestReview struct {
+						State       githubv4.PullRequestReviewState
+						SubmittedAt githubv4.DateTime
+					}
+				} `graphql:"submitPullRequestReview(input: $input)"`
+			}
+
+			if err := client.Mutate(
+				ctx,
+				&submitPullRequestReviewMutation,
+				githubv4.SubmitPullRequestReviewInput{
+					PullRequestReviewID: &pullRequestReviewID,
+					Event:               githubv4.PullRequestReviewEvent(event),
+					Body:                gqlBody,
+				},
+				nil,
+			); err != nil {
+				return mcp.NewToolResultError(err.Error()), nil
+			}
+
+			// Return the state and submitted at for LLM use as receipt.
+			response := map[string]any{
+				"pullRequestReviewState":       submitPullRequestReviewMutation.SubmitPullRequestReview.PullRequestReview.State,
+				"pullRequestReviewSubmittedAt": submitPullRequestReviewMutation.SubmitPullRequestReview.PullRequestReview.SubmittedAt,
+			}
+
+			r, err := json.Marshal(response)
 			if err != nil {
 				return nil, fmt.Errorf("failed to marshal response: %w", err)
 			}
