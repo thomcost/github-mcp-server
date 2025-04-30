@@ -3,9 +3,12 @@
 package e2e_test
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"slices"
@@ -13,9 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/go-github/v69/github"
+	"github.com/github/github-mcp-server/pkg/github"
+	gogithub "github.com/google/go-github/v69/github"
 	mcpClient "github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,47 +83,82 @@ func WithEnvVars(envVars map[string]string) ClientOption {
 func setupMCPClient(t *testing.T, options ...ClientOption) *mcpClient.Client {
 	// Get token and ensure Docker image is built
 	token := getE2EToken(t)
-	ensureDockerImageBuilt(t)
 
-	// Create and configure options
-	opts := &ClientOpts{
-		EnvVars: make(map[string]string),
+	// By default, we run the tests including the Docker image, but with DEBUG
+	// enabled, we run the server in-process, allowing for easier debugging.
+	var client *mcpClient.Client
+	if os.Getenv("GITHUB_MCP_SERVER_E2E_DEBUG") == "" {
+		ensureDockerImageBuilt(t)
+
+		// Create and configure options
+		opts := &ClientOpts{
+			EnvVars: make(map[string]string),
+		}
+
+		// Apply all options to configure the opts struct
+		for _, option := range options {
+			option(opts)
+		}
+
+		// Prepare Docker arguments
+		args := []string{
+			"docker",
+			"run",
+			"-i",
+			"--rm",
+			"-e",
+			"GITHUB_PERSONAL_ACCESS_TOKEN", // Personal access token is all required
+		}
+
+		// Add all environment variables to the Docker arguments
+		for key := range opts.EnvVars {
+			args = append(args, "-e", key)
+		}
+
+		// Add the image name
+		args = append(args, "github/e2e-github-mcp-server")
+
+		// Construct the env vars for the MCP Client to execute docker with
+		dockerEnvVars := make([]string, 0, len(opts.EnvVars)+1)
+		dockerEnvVars = append(dockerEnvVars, fmt.Sprintf("GITHUB_PERSONAL_ACCESS_TOKEN=%s", token))
+		for key, value := range opts.EnvVars {
+			dockerEnvVars = append(dockerEnvVars, fmt.Sprintf("%s=%s", key, value))
+		}
+
+		// Create the client
+		t.Log("Starting Stdio MCP client...")
+		var err error
+		client, err = mcpClient.NewStdioMCPClient(args[0], dockerEnvVars, args[1:]...)
+		require.NoError(t, err, "expected to create client successfully")
+	} else {
+		// Pipe setup: clientToServer simulates stdin/stdout
+		clientToServerR, clientToServerW := io.Pipe()
+		serverToClientR, serverToClientW := io.Pipe()
+		stderrBuf := &bytes.Buffer{}
+
+		go func() {
+			require.NoError(t,
+				github.RunStdioServer(github.RunConfig{
+					Stdin:  clientToServerR,
+					Stdout: serverToClientW,
+					// Version:            "",
+					Token:              token,
+					Logger:             &logrus.Logger{},
+					LogCommands:        false,
+					ReadOnly:           false,
+					ExportTranslations: false,
+					EnabledToolsets:    []string{"all"},
+				}),
+				"expected to start server successfully",
+			)
+		}()
+
+		transport := NewInProcessStdioTransport(serverToClientR, clientToServerW, stderrBuf)
+		require.NoError(t, transport.Start(context.Background()), "expected to start client successfully")
+
+		client = mcpClient.NewClient(transport)
 	}
 
-	// Apply all options to configure the opts struct
-	for _, option := range options {
-		option(opts)
-	}
-
-	// Prepare Docker arguments
-	args := []string{
-		"docker",
-		"run",
-		"-i",
-		"--rm",
-		"-e",
-		"GITHUB_PERSONAL_ACCESS_TOKEN", // Personal access token is all required
-	}
-
-	// Add all environment variables to the Docker arguments
-	for key := range opts.EnvVars {
-		args = append(args, "-e", key)
-	}
-
-	// Add the image name
-	args = append(args, "github/e2e-github-mcp-server")
-
-	// Construct the env vars for the MCP Client to execute docker with
-	dockerEnvVars := make([]string, 0, len(opts.EnvVars)+1)
-	dockerEnvVars = append(dockerEnvVars, fmt.Sprintf("GITHUB_PERSONAL_ACCESS_TOKEN=%s", token))
-	for key, value := range opts.EnvVars {
-		dockerEnvVars = append(dockerEnvVars, fmt.Sprintf("%s=%s", key, value))
-	}
-
-	// Create the client
-	t.Log("Starting Stdio MCP client...")
-	client, err := mcpClient.NewStdioMCPClient(args[0], dockerEnvVars, args[1:]...)
-	require.NoError(t, err, "expected to create client successfully")
 	t.Cleanup(func() {
 		require.NoError(t, client.Close(), "expected to close client successfully")
 	})
@@ -138,6 +179,217 @@ func setupMCPClient(t *testing.T, options ...ClientOption) *mcpClient.Client {
 	require.Equal(t, "github-mcp-server", result.ServerInfo.Name, "unexpected server name")
 
 	return client
+}
+
+type InProcessStdioTransport struct {
+	stdin  io.Writer
+	stdout *bufio.Reader
+	stderr io.Writer
+
+	responses      map[int64]chan *transport.JSONRPCResponse
+	mu             sync.RWMutex
+	done           chan struct{}
+	onNotification func(mcp.JSONRPCNotification)
+	notifyMu       sync.RWMutex
+
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+var _ transport.Interface = (*InProcessStdioTransport)(nil)
+
+func NewInProcessStdioTransport(r io.Reader, w io.Writer, stderr io.Writer) *InProcessStdioTransport {
+	return &InProcessStdioTransport{
+		stdin:     w,
+		stdout:    bufio.NewReader(r),
+		stderr:    stderr,
+		responses: make(map[int64]chan *transport.JSONRPCResponse),
+		done:      make(chan struct{}),
+	}
+}
+
+func (c *InProcessStdioTransport) Start(ctx context.Context) error {
+	c.startOnce.Do(func() {
+		go c.readResponses()
+	})
+	return nil
+}
+
+func (c *InProcessStdioTransport) Close() error {
+	c.closeOnce.Do(func() {
+		close(c.done)
+	})
+	return nil
+}
+
+func (c *InProcessStdioTransport) SendRequest(
+	ctx context.Context,
+	request transport.JSONRPCRequest,
+) (*transport.JSONRPCResponse, error) {
+	if c.stdin == nil {
+		return nil, fmt.Errorf("in-process stdio not started")
+	}
+
+	responseChan := make(chan *transport.JSONRPCResponse, 1)
+
+	c.mu.Lock()
+	c.responses[request.ID] = responseChan
+	c.mu.Unlock()
+
+	requestBytes, err := json.Marshal(request)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+	requestBytes = append(requestBytes, '\n')
+
+	if _, err := c.stdin.Write(requestBytes); err != nil {
+		return nil, fmt.Errorf("failed to write request: %w", err)
+	}
+
+	select {
+	case <-ctx.Done():
+		c.mu.Lock()
+		delete(c.responses, request.ID)
+		c.mu.Unlock()
+		return nil, ctx.Err()
+	case response := <-responseChan:
+		return response, nil
+	}
+}
+
+func (c *InProcessStdioTransport) SendNotification(
+	ctx context.Context,
+	notification mcp.JSONRPCNotification,
+) error {
+	notificationBytes, err := json.Marshal(notification)
+	if err != nil {
+		return fmt.Errorf("failed to marshal notification: %w", err)
+	}
+	notificationBytes = append(notificationBytes, '\n')
+
+	if _, err := c.stdin.Write(notificationBytes); err != nil {
+		return fmt.Errorf("failed to write notification: %w", err)
+	}
+	return nil
+}
+
+func (c *InProcessStdioTransport) SetNotificationHandler(handler func(notification mcp.JSONRPCNotification)) {
+	c.notifyMu.Lock()
+	defer c.notifyMu.Unlock()
+	c.onNotification = handler
+}
+
+func (c *InProcessStdioTransport) readResponses() {
+	for {
+		select {
+		case <-c.done:
+			return
+		default:
+			line, err := c.stdout.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					fmt.Fprintf(c.stderr, "error reading response: %v\n", err)
+				}
+				return
+			}
+
+			var baseMessage transport.JSONRPCResponse
+			if err := json.Unmarshal([]byte(line), &baseMessage); err != nil {
+				continue
+			}
+
+			if baseMessage.ID == nil {
+				var notification mcp.JSONRPCNotification
+				if err := json.Unmarshal([]byte(line), &notification); err != nil {
+					continue
+				}
+				c.notifyMu.RLock()
+				if c.onNotification != nil {
+					c.onNotification(notification)
+				}
+				c.notifyMu.RUnlock()
+				continue
+			}
+
+			c.mu.RLock()
+			ch, ok := c.responses[*baseMessage.ID]
+			c.mu.RUnlock()
+
+			if ok {
+				ch <- &baseMessage
+				c.mu.Lock()
+				delete(c.responses, *baseMessage.ID)
+				c.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (c *InProcessStdioTransport) Stderr() io.Writer {
+	return c.stderr
+}
+
+func TestInProcessMCPClient(t *testing.T) {
+	// Pipe setup: clientToServer simulates stdin/stdout
+	clientToServerR, clientToServerW := io.Pipe()
+	serverToClientR, serverToClientW := io.Pipe()
+	stderrBuf := &bytes.Buffer{}
+
+	transport := NewInProcessStdioTransport(serverToClientR, clientToServerW, stderrBuf)
+
+	// Simulated in-memory server
+	go func() {
+		decoder := json.NewDecoder(clientToServerR)
+		encoder := json.NewEncoder(serverToClientW)
+
+		for {
+			var req mcp.JSONRPCRequest
+			if err := decoder.Decode(&req); err != nil {
+				return
+			}
+
+			// Log request to stderr
+			stderrBuf.WriteString("received method: " + req.Method + "\n")
+
+			// Respond to initialization
+			resp := mcp.JSONRPCResponse{
+				JSONRPC: "2.0",
+				ID:      req.ID,
+				Result: mcp.InitializeResult{
+					ProtocolVersion: "2025-03-26",
+					Capabilities:    mcp.ServerCapabilities{},
+					ServerInfo: mcp.Implementation{
+						Name:    "in-process-server",
+						Version: "v0.0.1",
+					},
+				},
+			}
+			_ = encoder.Encode(resp)
+		}
+	}()
+
+	// Create the client
+
+	require.NoError(t, transport.Start(context.Background()), "expected to start client successfully")
+	client := mcpClient.NewClient(transport)
+	t.Cleanup(func() {
+		require.NoError(t, client.Close(), "expected to close client successfully")
+	})
+
+	// Initialize the client
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	request := mcp.InitializeRequest{}
+	request.Params.ProtocolVersion = "2025-03-26"
+	request.Params.ClientInfo = mcp.Implementation{
+		Name:    "e2e-test-client",
+		Version: "0.0.1",
+	}
+
+	result, err := client.Initialize(ctx, request)
+	require.NoError(t, err, "failed to initialize client")
+	require.Equal(t, "in-process-server", result.ServerInfo.Name, "unexpected server name")
 }
 
 func TestGetMe(t *testing.T) {
@@ -169,7 +421,7 @@ func TestGetMe(t *testing.T) {
 
 	// Then the login in the response should match the login obtained via the same
 	// token using the GitHub API.
-	ghClient := github.NewClient(nil).WithAuthToken(getE2EToken(t))
+	ghClient := gogithub.NewClient(nil).WithAuthToken(getE2EToken(t))
 	user, _, err := ghClient.Users.Get(context.Background(), "")
 	require.NoError(t, err, "expected to get user successfully")
 	require.Equal(t, trimmedContent.Login, *user.Login, "expected login to match")
@@ -253,7 +505,7 @@ func TestTags(t *testing.T) {
 	// Cleanup the repository after the test
 	t.Cleanup(func() {
 		// MCP Server doesn't support deletions, but we can use the GitHub Client
-		ghClient := github.NewClient(nil).WithAuthToken(getE2EToken(t))
+		ghClient := gogithub.NewClient(nil).WithAuthToken(getE2EToken(t))
 		t.Logf("Deleting repository %s/%s...", currentOwner, repoName)
 		_, err := ghClient.Repositories.Delete(context.Background(), currentOwner, repoName)
 		require.NoError(t, err, "expected to delete repository successfully")
@@ -261,24 +513,24 @@ func TestTags(t *testing.T) {
 
 	// Then create a tag
 	// MCP Server doesn't support tag creation, but we can use the GitHub Client
-	ghClient := github.NewClient(nil).WithAuthToken(getE2EToken(t))
+	ghClient := gogithub.NewClient(nil).WithAuthToken(getE2EToken(t))
 	t.Logf("Creating tag %s/%s:%s...", currentOwner, repoName, "v0.0.1")
 	ref, _, err := ghClient.Git.GetRef(context.Background(), currentOwner, repoName, "refs/heads/main")
 	require.NoError(t, err, "expected to get ref successfully")
 
-	tagObj, _, err := ghClient.Git.CreateTag(context.Background(), currentOwner, repoName, &github.Tag{
-		Tag:     github.Ptr("v0.0.1"),
-		Message: github.Ptr("v0.0.1"),
-		Object: &github.GitObject{
+	tagObj, _, err := ghClient.Git.CreateTag(context.Background(), currentOwner, repoName, &gogithub.Tag{
+		Tag:     gogithub.Ptr("v0.0.1"),
+		Message: gogithub.Ptr("v0.0.1"),
+		Object: &gogithub.GitObject{
 			SHA:  ref.Object.SHA,
-			Type: github.Ptr("commit"),
+			Type: gogithub.Ptr("commit"),
 		},
 	})
 	require.NoError(t, err, "expected to create tag object successfully")
 
-	_, _, err = ghClient.Git.CreateRef(context.Background(), currentOwner, repoName, &github.Reference{
-		Ref: github.Ptr("refs/tags/v0.0.1"),
-		Object: &github.GitObject{
+	_, _, err = ghClient.Git.CreateRef(context.Background(), currentOwner, repoName, &gogithub.Reference{
+		Ref: gogithub.Ptr("refs/tags/v0.0.1"),
+		Object: &gogithub.GitObject{
 			SHA: tagObj.SHA,
 		},
 	})
