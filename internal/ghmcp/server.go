@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/github/github-mcp-server/pkg/github"
 	mcplog "github.com/github/github-mcp-server/pkg/log"
@@ -416,50 +417,149 @@ func RunMultiUserHTTPServer(cfg MultiUserHTTPServerConfig) error {
 
 	t, _ := translations.TranslationHelper()
 
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := extractTokenFromRequest(r)
-		if token == "" {
-			w.WriteHeader(http.StatusUnauthorized)
-			_, _ = w.Write([]byte(`{"error":"missing GitHub token in Authorization header"}`))
-			return
-		}
-		ghServer, err := NewMCPServer(MCPServerConfig{
-			Version:         cfg.Version,
-			Host:            cfg.Host,
-			Token:           token,
-			EnabledToolsets: cfg.EnabledToolsets,
-			DynamicToolsets: cfg.DynamicToolsets,
-			ReadOnly:        cfg.ReadOnly,
-			Translator:      t,
-		})
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"failed to create MCP server"}`))
-			return
-		}
-		// Use the MCP server's HTTP handler for this request
-		mcpHTTP := server.NewStreamableHTTPServer(ghServer)
-		mcpHTTP.ServeHTTP(w, r)
-	})
+	// Parse API host once for reuse
+	apiHost, err := parseAPIHost(cfg.Host)
+	if err != nil {
+		return fmt.Errorf("failed to parse API host: %w", err)
+	}
 
-	addr := fmt.Sprintf(":%d", cfg.Port)
-	fmt.Fprintf(os.Stderr, "GitHub MCP Server running in multi-user HTTP mode on %s\n", addr)
-	server := &http.Server{Addr: addr, Handler: handler}
+	// Create token-aware client factories that extract tokens from request context
+	getClient := func(ctx context.Context) (*gogithub.Client, error) {
+		token, ok := ctx.Value("github_token").(string)
+		if !ok || token == "" {
+			return nil, fmt.Errorf("no GitHub token found in request context")
+		}
+
+		client := gogithub.NewClient(nil).WithAuthToken(token)
+		client.UserAgent = fmt.Sprintf("github-mcp-server/%s", cfg.Version)
+		client.BaseURL = apiHost.baseRESTURL
+		client.UploadURL = apiHost.uploadURL
+		return client, nil
+	}
+
+	getGQLClient := func(ctx context.Context) (*githubv4.Client, error) {
+		token, ok := ctx.Value("github_token").(string)
+		if !ok || token == "" {
+			return nil, fmt.Errorf("no GitHub token found in request context")
+		}
+
+		httpClient := &http.Client{
+			Transport: &bearerAuthTransport{
+				transport: http.DefaultTransport,
+				token:     token,
+			},
+		}
+		return githubv4.NewEnterpriseClient(apiHost.graphqlURL.String(), httpClient), nil
+	}
+
+	// Create MCP server once with token-aware client factories
+	ghServer := github.NewServer(cfg.Version)
+
+	enabledToolsets := cfg.EnabledToolsets
+	if cfg.DynamicToolsets {
+		// filter "all" from the enabled toolsets
+		enabledToolsets = make([]string, 0, len(cfg.EnabledToolsets))
+		for _, toolset := range cfg.EnabledToolsets {
+			if toolset != "all" {
+				enabledToolsets = append(enabledToolsets, toolset)
+			}
+		}
+	}
+
+	// Create default toolsets with token-aware client factories
+	tsg := github.DefaultToolsetGroup(cfg.ReadOnly, getClient, getGQLClient, t)
+	err = tsg.EnableToolsets(enabledToolsets)
+	if err != nil {
+		return fmt.Errorf("failed to enable toolsets: %w", err)
+	}
+
+	contextToolset := github.InitContextToolset(getClient, t)
+	github.RegisterResources(ghServer, getClient, t)
+
+	// Register the tools with the server
+	tsg.RegisterTools(ghServer)
+	contextToolset.RegisterTools(ghServer)
+
+	if cfg.DynamicToolsets {
+		dynamic := github.InitDynamicToolset(ghServer, tsg, t)
+		dynamic.RegisterTools(ghServer)
+	}
+
+	// Create streamable HTTP server once
+	mcpHTTPServer := server.NewStreamableHTTPServer(ghServer)
+
+	// Create HTTP handler that injects tokens into context
+	handler := &multiUserHandler{
+		mcpServer: mcpHTTPServer,
+	}
+
+	// Setup HTTP server with proper timeouts
+	httpServer := &http.Server{
+		Addr:         fmt.Sprintf(":%d", cfg.Port),
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	fmt.Fprintf(os.Stderr, "GitHub MCP Server running in multi-user HTTP mode on :%d\n", cfg.Port)
+
+	// Start server in goroutine
+	errChan := make(chan error, 1)
 	go func() {
-		<-ctx.Done()
-		_ = server.Shutdown(context.Background())
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errChan <- err
+		}
 	}()
-	return server.ListenAndServe()
+
+	// Wait for shutdown signal or error
+	select {
+	case <-ctx.Done():
+		fmt.Fprintf(os.Stderr, "Shutting down server...\n")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	case err := <-errChan:
+		return fmt.Errorf("server error: %w", err)
+	}
+}
+
+// multiUserHandler handles per-request token extraction and injection
+type multiUserHandler struct {
+	mcpServer http.Handler
+}
+
+func (h *multiUserHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	token := extractTokenFromRequest(r)
+	if token == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":"missing GitHub token in Authorization header"}`))
+		return
+	}
+
+	// Inject token into request context
+	ctx := context.WithValue(r.Context(), "github_token", token)
+	h.mcpServer.ServeHTTP(w, r.WithContext(ctx))
 }
 
 // extractTokenFromRequest extracts the GitHub token from the Authorization header
 func extractTokenFromRequest(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if h == "" {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
 		return ""
 	}
-	if strings.HasPrefix(h, "Bearer ") {
-		return strings.TrimPrefix(h, "Bearer ")
+	
+	// Only accept proper Bearer token format
+	if !strings.HasPrefix(authHeader, "Bearer ") {
+		return ""
 	}
-	return h
+	
+	token := strings.TrimPrefix(authHeader, "Bearer ")
+	// Basic validation - non-empty and reasonable length
+	if len(token) < 10 {
+		return ""
+	}
+	
+	return token
 }

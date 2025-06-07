@@ -976,7 +976,8 @@ This project is licensed under the terms of the MIT open source license. Please 
 The GitHub MCP Server supports a multi-user HTTP mode for enterprise and cloud scenarios. In this mode, the server does **not** require a global GitHub token at startup. Instead, each HTTP request must include a GitHub token in the `Authorization` header:
 
 - The token is **never** passed as a tool parameter or exposed to the agent/model.
-- The server extracts the token from the `Authorization` header for each request and creates a new GitHub client per request.
+- The server extracts the token from the `Authorization` header for each request and creates GitHub clients per request using token-aware client factories.
+- Optimized for performance: single MCP server instance with per-request authentication.
 - This enables secure, scalable, and multi-tenant deployments.
 
 ### Usage
