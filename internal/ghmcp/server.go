@@ -2,6 +2,9 @@ package ghmcp
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -415,82 +419,12 @@ func RunMultiUserHTTPServer(cfg MultiUserHTTPServerConfig) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	t, _ := translations.TranslationHelper()
+	// Create session manager for multi-user sessions
+	sessionManager := NewSessionManager(cfg)
 
-	// Parse API host once for reuse
-	apiHost, err := parseAPIHost(cfg.Host)
-	if err != nil {
-		return fmt.Errorf("failed to parse API host: %w", err)
-	}
-
-	// Create token-aware client factories that extract tokens from request context
-	getClient := func(ctx context.Context) (*gogithub.Client, error) {
-		token, ok := ctx.Value("github_token").(string)
-		if !ok || token == "" {
-			return nil, fmt.Errorf("no GitHub token found in request context")
-		}
-
-		client := gogithub.NewClient(nil).WithAuthToken(token)
-		client.UserAgent = fmt.Sprintf("github-mcp-server/%s", cfg.Version)
-		client.BaseURL = apiHost.baseRESTURL
-		client.UploadURL = apiHost.uploadURL
-		return client, nil
-	}
-
-	getGQLClient := func(ctx context.Context) (*githubv4.Client, error) {
-		token, ok := ctx.Value("github_token").(string)
-		if !ok || token == "" {
-			return nil, fmt.Errorf("no GitHub token found in request context")
-		}
-
-		httpClient := &http.Client{
-			Transport: &bearerAuthTransport{
-				transport: http.DefaultTransport,
-				token:     token,
-			},
-		}
-		return githubv4.NewEnterpriseClient(apiHost.graphqlURL.String(), httpClient), nil
-	}
-
-	// Create MCP server once with token-aware client factories
-	ghServer := github.NewServer(cfg.Version)
-
-	enabledToolsets := cfg.EnabledToolsets
-	if cfg.DynamicToolsets {
-		// filter "all" from the enabled toolsets
-		enabledToolsets = make([]string, 0, len(cfg.EnabledToolsets))
-		for _, toolset := range cfg.EnabledToolsets {
-			if toolset != "all" {
-				enabledToolsets = append(enabledToolsets, toolset)
-			}
-		}
-	}
-
-	// Create default toolsets with token-aware client factories
-	tsg := github.DefaultToolsetGroup(cfg.ReadOnly, getClient, getGQLClient, t)
-	err = tsg.EnableToolsets(enabledToolsets)
-	if err != nil {
-		return fmt.Errorf("failed to enable toolsets: %w", err)
-	}
-
-	contextToolset := github.InitContextToolset(getClient, t)
-	github.RegisterResources(ghServer, getClient, t)
-
-	// Register the tools with the server
-	tsg.RegisterTools(ghServer)
-	contextToolset.RegisterTools(ghServer)
-
-	if cfg.DynamicToolsets {
-		dynamic := github.InitDynamicToolset(ghServer, tsg, t)
-		dynamic.RegisterTools(ghServer)
-	}
-
-	// Create streamable HTTP server once
-	mcpHTTPServer := server.NewStreamableHTTPServer(ghServer)
-
-	// Create HTTP handler that injects tokens into context
+	// Create HTTP handler that manages sessions
 	handler := &multiUserHandler{
-		mcpServer: mcpHTTPServer,
+		sessionManager: sessionManager,
 	}
 
 	// Setup HTTP server with proper timeouts
@@ -524,9 +458,157 @@ func RunMultiUserHTTPServer(cfg MultiUserHTTPServerConfig) error {
 	}
 }
 
-// multiUserHandler handles per-request token extraction and injection
+// Session represents an MCP session with associated GitHub token
+type Session struct {
+	ID          string
+	Token       string
+	Server      *server.MCPServer
+	HTTPHandler http.Handler
+	Created     time.Time
+	LastUsed    time.Time
+}
+
+// SessionManager manages MCP sessions for multi-user HTTP mode
+type SessionManager struct {
+	sessions map[string]*Session
+	mutex    sync.RWMutex
+	cfg      MultiUserHTTPServerConfig
+}
+
+// NewSessionManager creates a new session manager
+func NewSessionManager(cfg MultiUserHTTPServerConfig) *SessionManager {
+	sm := &SessionManager{
+		sessions: make(map[string]*Session),
+		cfg:      cfg,
+	}
+	
+	// Start cleanup goroutine
+	go sm.cleanupRoutine()
+	
+	return sm
+}
+
+// cleanupRoutine periodically removes expired sessions
+func (sm *SessionManager) cleanupRoutine() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		sm.mutex.Lock()
+		now := time.Now()
+		for id, session := range sm.sessions {
+			// Remove sessions older than 1 hour or unused for 30 minutes
+			if now.Sub(session.Created) > time.Hour || now.Sub(session.LastUsed) > 30*time.Minute {
+				delete(sm.sessions, id)
+			}
+		}
+		sm.mutex.Unlock()
+	}
+}
+
+// generateSessionID creates a new unique session ID
+func generateSessionID() string {
+	bytes := make([]byte, 16)
+	rand.Read(bytes)
+	return hex.EncodeToString(bytes)
+}
+
+// CreateSession creates a new MCP session for the given token
+func (sm *SessionManager) CreateSession(token string) (*Session, error) {
+	sessionID := generateSessionID()
+	
+	// Parse API host
+	apiHost, err := parseAPIHost(sm.cfg.Host)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse API host: %w", err)
+	}
+	
+	t, _ := translations.TranslationHelper()
+	
+	// Create token-aware client factories for this session
+	getClient := func(ctx context.Context) (*gogithub.Client, error) {
+		client := gogithub.NewClient(nil).WithAuthToken(token)
+		client.UserAgent = fmt.Sprintf("github-mcp-server/%s", sm.cfg.Version)
+		client.BaseURL = apiHost.baseRESTURL
+		client.UploadURL = apiHost.uploadURL
+		return client, nil
+	}
+	
+	getGQLClient := func(ctx context.Context) (*githubv4.Client, error) {
+		httpClient := &http.Client{
+			Transport: &bearerAuthTransport{
+				transport: http.DefaultTransport,
+				token:     token,
+			},
+		}
+		return githubv4.NewEnterpriseClient(apiHost.graphqlURL.String(), httpClient), nil
+	}
+	
+	// Create MCP server for this session
+	ghServer := github.NewServer(sm.cfg.Version)
+	
+	enabledToolsets := sm.cfg.EnabledToolsets
+	if sm.cfg.DynamicToolsets {
+		enabledToolsets = make([]string, 0, len(sm.cfg.EnabledToolsets))
+		for _, toolset := range sm.cfg.EnabledToolsets {
+			if toolset != "all" {
+				enabledToolsets = append(enabledToolsets, toolset)
+			}
+		}
+	}
+	
+	// Create and register toolsets for this session
+	tsg := github.DefaultToolsetGroup(sm.cfg.ReadOnly, getClient, getGQLClient, t)
+	if err := tsg.EnableToolsets(enabledToolsets); err != nil {
+		return nil, fmt.Errorf("failed to enable toolsets: %w", err)
+	}
+
+	contextToolset := github.InitContextToolset(getClient, t)
+	github.RegisterResources(ghServer, getClient, t)
+
+	// Register the tools with the server
+	tsg.RegisterTools(ghServer)
+	contextToolset.RegisterTools(ghServer)
+
+	if sm.cfg.DynamicToolsets {
+		dynamic := github.InitDynamicToolset(ghServer, tsg, t)
+		dynamic.RegisterTools(ghServer)
+	}
+	
+	// Create HTTP handler for this session
+	httpHandler := server.NewStreamableHTTPServer(ghServer)
+	
+	session := &Session{
+		ID:          sessionID,
+		Token:       token,
+		Server:      ghServer,
+		HTTPHandler: httpHandler,
+		Created:     time.Now(),
+		LastUsed:    time.Now(),
+	}
+	
+	sm.mutex.Lock()
+	sm.sessions[sessionID] = session
+	sm.mutex.Unlock()
+	
+	return session, nil
+}
+
+// GetSession retrieves a session by ID
+func (sm *SessionManager) GetSession(sessionID string) (*Session, bool) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+	
+	session, exists := sm.sessions[sessionID]
+	if exists {
+		session.LastUsed = time.Now()
+	}
+	return session, exists
+}
+
+// multiUserHandler handles MCP sessions for multi-user HTTP mode
 type multiUserHandler struct {
-	mcpServer http.Handler
+	sessionManager *SessionManager
 }
 
 func (h *multiUserHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -537,10 +619,147 @@ func (h *multiUserHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"error":"missing GitHub token in Authorization header"}`))
 		return
 	}
+	
+	// Parse the MCP request to handle session management
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "Failed to read request body", http.StatusBadRequest)
+		return
+	}
+	
+	var mcpRequest struct {
+		Jsonrpc string      `json:"jsonrpc"`
+		ID      interface{} `json:"id"`
+		Method  string      `json:"method"`
+		Params  interface{} `json:"params"`
+	}
+	
+	if err := json.Unmarshal(body, &mcpRequest); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Handle initialize method - create new session
+	if mcpRequest.Method == "initialize" {
+		session, err := h.sessionManager.CreateSession(token)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"jsonrpc": "2.0",
+				"id":      mcpRequest.ID,
+				"error": map[string]interface{}{
+					"code":    -32603,
+					"message": fmt.Sprintf("Failed to create session: %v", err),
+				},
+			})
+			return
+		}
+		
+		// Forward the initialize request to the session's HTTP handler
+		// but first restore the body
+		newReq := r.Clone(r.Context())
+		newReq.Body = io.NopCloser(strings.NewReader(string(body)))
+		
+		// Use a response recorder to capture the response
+		recorder := &responseRecorder{body: &strings.Builder{}, headers: make(http.Header)}
+		session.HTTPHandler.ServeHTTP(recorder, newReq)
+		
+		// Parse the response and add session ID
+		var response map[string]interface{}
+		if err := json.Unmarshal([]byte(recorder.body.String()), &response); err != nil {
+			http.Error(w, "Failed to parse server response", http.StatusInternalServerError)
+			return
+		}
+		
+		// Add session ID to the response
+		if result, ok := response["result"].(map[string]interface{}); ok {
+			result["sessionId"] = session.ID
+		}
+		
+		// Copy headers and write response
+		for k, v := range recorder.headers {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(recorder.statusCode)
+		json.NewEncoder(w).Encode(response)
+		return
+	}
+	
+	// For non-initialize methods, get session ID from request
+	sessionID := r.Header.Get("X-MCP-Session-ID")
+	if sessionID == "" {
+		// Try to extract from URL query parameter as fallback
+		sessionID = r.URL.Query().Get("session_id")
+	}
+	
+	if sessionID == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      mcpRequest.ID,
+			"error": map[string]interface{}{
+				"code":    -32602,
+				"message": "Missing session ID. Use X-MCP-Session-ID header or session_id query parameter",
+			},
+		})
+		return
+	}
+	
+	session, exists := h.sessionManager.GetSession(sessionID)
+	if !exists {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      mcpRequest.ID,
+			"error": map[string]interface{}{
+				"code":    -32602,
+				"message": "Invalid session ID",
+			},
+		})
+		return
+	}
+	
+	// Verify token matches session
+	if session.Token != token {
+		w.WriteHeader(http.StatusUnauthorized)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"jsonrpc": "2.0",
+			"id":      mcpRequest.ID,
+			"error": map[string]interface{}{
+				"code":    -32602,
+				"message": "Token mismatch for session",
+			},
+		})
+		return
+	}
+	
+	// Forward the request to the session's HTTP handler
+	newReq := r.Clone(r.Context())
+	newReq.Body = io.NopCloser(strings.NewReader(string(body)))
+	
+	// Use the session's HTTP handler to process the request
+	session.HTTPHandler.ServeHTTP(w, newReq)
+}
 
-	// Inject token into request context
-	ctx := context.WithValue(r.Context(), "github_token", token)
-	h.mcpServer.ServeHTTP(w, r.WithContext(ctx))
+// responseRecorder captures HTTP responses for modification
+type responseRecorder struct {
+	statusCode int
+	headers    http.Header
+	body       *strings.Builder
+}
+
+func (r *responseRecorder) Header() http.Header {
+	return r.headers
+}
+
+func (r *responseRecorder) Write(data []byte) (int, error) {
+	return r.body.Write(data)
+}
+
+func (r *responseRecorder) WriteHeader(statusCode int) {
+	r.statusCode = statusCode
 }
 
 // extractTokenFromRequest extracts the GitHub token from the Authorization header

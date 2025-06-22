@@ -1,0 +1,96 @@
+# AWS ECS Task Definition for GitHub MCP Server Multi-User Mode
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: github-mcp-server-deployment
+data:
+  # ECS Task Definition (JSON format for AWS CLI)
+  task-definition.json: |
+    {
+      "family": "github-mcp-server-multiuser",
+      "networkMode": "awsvpc",
+      "requiresCompatibilities": ["FARGATE"],
+      "cpu": "256",
+      "memory": "512",
+      "executionRoleArn": "arn:aws:iam::ACCOUNT:role/ecsTaskExecutionRole",
+      "containerDefinitions": [
+        {
+          "name": "github-mcp-server",
+          "image": "your-registry/github-mcp-server:latest",
+          "essential": true,
+          "portMappings": [
+            {
+              "containerPort": 8080,
+              "protocol": "tcp"
+            }
+          ],
+          "logConfiguration": {
+            "logDriver": "awslogs",
+            "options": {
+              "awslogs-group": "/ecs/github-mcp-server",
+              "awslogs-region": "us-east-1",
+              "awslogs-stream-prefix": "ecs"
+            }
+          },
+          "environment": [],
+          "healthCheck": {
+            "command": [
+              "CMD-SHELL",
+              "curl -f http://localhost:8080/health || exit 1"
+            ],
+            "interval": 30,
+            "timeout": 5,
+            "retries": 3,
+            "startPeriod": 60
+          }
+        }
+      ]
+    }
+
+  # Application Load Balancer Target Group (for Terraform/CloudFormation)
+  alb-target-group.tf: |
+    resource "aws_lb_target_group" "github_mcp_server" {
+      name     = "github-mcp-server-tg"
+      port     = 8080
+      protocol = "HTTP"
+      vpc_id   = var.vpc_id
+      target_type = "ip"
+
+      health_check {
+        enabled             = true
+        healthy_threshold   = 2
+        unhealthy_threshold = 10
+        timeout             = 5
+        interval            = 30
+        path                = "/health"
+        matcher             = "200"
+      }
+
+      tags = {
+        Name = "github-mcp-server-multiuser"
+      }
+    }
+
+  # ECS Service Configuration
+  ecs-service.tf: |
+    resource "aws_ecs_service" "github_mcp_server" {
+      name            = "github-mcp-server-multiuser"
+      cluster         = var.ecs_cluster_id
+      task_definition = aws_ecs_task_definition.github_mcp_server.arn
+      desired_count   = 2
+      launch_type     = "FARGATE"
+
+      network_configuration {
+        security_groups  = [aws_security_group.github_mcp_server.id]
+        subnets         = var.private_subnet_ids
+        assign_public_ip = false
+      }
+
+      load_balancer {
+        target_group_arn = aws_lb_target_group.github_mcp_server.arn
+        container_name   = "github-mcp-server"
+        container_port   = 8080
+      }
+
+      depends_on = [aws_lb_listener.github_mcp_server]
+    }

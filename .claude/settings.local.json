@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(gh pr view:*)",
+      "Bash(git commit:*)",
+      "Bash(mkdir:*)",
+      "Bash(cdk init:*)",
+      "Bash(ls:*)",
+      "Bash(npm run build:*)",
+      "Bash(npx cdk:*)",
+      "Bash(aws cloudformation describe-stacks:*)",
+      "Bash(aws ecr describe-repositories:*)",
+      "Bash(docker build:*)",
+      "Bash(docker push:*)",
+      "Bash(aws iam list-roles:*)",
+      "Bash(aws cloudformation:*)",
+      "Bash(aws elbv2 describe-load-balancers:*)",
+      "Bash(aws ecs register-task-definition:*)",
+      "Bash(aws ecs update-service:*)",
+      "Bash(aws ecs describe-services:*)",
+      "Bash(aws elbv2 describe-target-groups:*)",
+      "Bash(aws elbv2 describe-target-health:*)",
+      "Bash(aws elbv2 modify-target-group:*)",
+      "Bash(aws:*)",
+      "Bash(chmod:*)",
+      "Bash(./test-mcp-session.sh:*)",
+      "Bash(cdk deploy:*)",
+      "Bash(go run:*)",
+      "Bash(grep:*)",
+      "WebFetch(domain:pkg.go.dev)"
+    ],
+    "deny": []
+  }
+}

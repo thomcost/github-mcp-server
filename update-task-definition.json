@@ -1,0 +1,36 @@
+{
+  "family": "github-mcp-server-multiuser",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::537965012092:role/GitHubMcpMultiuserStack-GitHubMcpTaskDefExecutionRo-6oIdMzoHMPcD",
+  "taskRoleArn": "arn:aws:iam::537965012092:role/GitHubMcpMultiuserStack-GitHubMcpTaskDefTaskRole3B5-bPxIZMrmmGhA",
+  "containerDefinitions": [
+    {
+      "name": "GitHubMcpContainer",
+      "image": "537965012092.dkr.ecr.us-east-1.amazonaws.com/github-mcp-server-multiuser:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/github-mcp-server-multiuser",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "github-mcp-server"
+        }
+      },
+      "environment": [
+        {
+          "name": "PORT",
+          "value": "8080"
+        }
+      ]
+    }
+  ]
+}
